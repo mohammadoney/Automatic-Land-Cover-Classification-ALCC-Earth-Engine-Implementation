@@ -1,0 +1,374 @@
+/**
+ * AUTOMATIC LAND COVER CLASSIFICATION (ALCC) APP
+ * Dataset: Landsat 8 Collection 2 Level 2
+ * Validation: Dynamic World V1 (Matched to User Year, Resampled to 30m)
+ * Features: ALCC Algorithm, Safe Download, Accuracy, Legend, Author Info
+ * Fixes: Race conditions, Dynamic Validation Year, Case-Insensitive Search
+ */
+
+// ================= UI SETUP =================
+var mainPanel = ui.Panel({
+  style: {width: '350px', padding: '10px'}
+});
+
+var title = ui.Label({
+  value: 'Automatic Land Cover Classifier',
+  style: {fontSize: '20px', fontWeight: 'bold', margin: '0 0 10px 0'}
+});
+
+var description = ui.Label({
+  value: 'Enter a city name and year to generate a land cover map using the ALCC method (Water -> Veg -> Bare -> Built-up).',
+  style: {color: '#555', margin: '0 0 15px 0'}
+});
+
+mainPanel.add(title);
+mainPanel.add(description);
+
+// Input Container
+var inputPanel = ui.Panel({
+  layout: ui.Panel.Layout.flow('vertical'),
+  style: {border: '1px solid #ddd', padding: '10px'}
+});
+
+// City Input
+var cityInput = ui.Textbox({
+  placeholder: 'Enter city (e.g., Chittagong)',
+  value: 'Chittagong', // Default
+  style: {width: '100%', margin: '0 0 10px 0'} 
+});
+
+// Year Input
+var yearInput = ui.Textbox({
+  placeholder: 'Enter year (e.g., 2023)',
+  value: '2023', // Default
+  style: {width: '100%', margin: '0 0 10px 0'}
+});
+
+var loadButton = ui.Button({
+  label: 'Generate Map',
+  style: {width: '100%'}
+});
+
+inputPanel.add(ui.Label('City Name:', {fontWeight: 'bold'}));
+inputPanel.add(cityInput);
+inputPanel.add(ui.Label('Year:', {fontWeight: 'bold'}));
+inputPanel.add(yearInput);
+inputPanel.add(loadButton);
+
+mainPanel.add(inputPanel);
+
+// Results Panel (Holds Status, Download Link, Accuracy, Legend)
+var resultsPanel = ui.Panel({
+  style: {margin: '15px 0 0 0'}
+});
+mainPanel.add(resultsPanel);
+
+// Author Information Panel
+var authorPanel = ui.Panel({
+  style: {padding: '8px', margin: '20px 0 0 0', backgroundColor: '#f5f5f5'}
+});
+authorPanel.add(ui.Label({
+  value: 'App by Md Rokib Uddin Oney',
+  style: {fontSize: '14px', fontWeight: 'bold'}
+}));
+authorPanel.add(ui.Label({
+  value: 'Email: mohammadoney@gmail.com',
+  style: {fontSize: '14px'}
+}));
+mainPanel.add(authorPanel);
+
+ui.root.add(mainPanel);
+
+// ================= LOGIC & FUNCTIONS =================
+
+// Global variable to track the latest click timestamp
+var lastClickId = 0;
+
+// 1. DATASETS
+var gaul = ee.FeatureCollection("FAO/GAUL_SIMPLIFIED_500m/2015/level2");
+
+// 2. HELPER: STRING FORMATTING
+function formatCityName(name) {
+  if (!name) return "";
+  // Split by space to handle multi-word cities like "New York"
+  return name.trim().toLowerCase().split(' ').map(function(word) {
+    return word.charAt(0).toUpperCase() + word.slice(1);
+  }).join(' ');
+}
+
+// 3. HELPER: ALCC PROCESSING
+function maskL8sr(image) {
+  var qaMask = image.select('QA_PIXEL').bitwiseAnd(parseInt('11111', 2)).eq(0);
+  var saturationMask = image.select('QA_RADSAT').eq(0);
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true)
+      .addBands(thermalBands, null, true)
+      .updateMask(qaMask).updateMask(saturationMask);
+}
+
+function getLandsatImage(roi, year) {
+  var start = year + '-01-01';
+  var end = year + '-12-31';
+  var col = ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+    .filterBounds(roi)
+    .filterDate(start, end)
+    .filter(ee.Filter.lt('CLOUD_COVER', 20))
+    .map(maskL8sr);
+  return col.median().clip(roi);
+}
+
+function addIndices(img, roi) {
+  var mndwi = img.normalizedDifference(['SR_B3', 'SR_B6']).rename('MNDWI');
+  var ndvi = img.normalizedDifference(['SR_B5', 'SR_B4']).rename('NDVI');
+  
+  var tirs = img.select('ST_B10');
+  var minMax = tirs.reduceRegion({
+    reducer: ee.Reducer.minMax(), geometry: roi, scale: 100, bestEffort: true
+  });
+  var tMin = ee.Number(minMax.get('ST_B10_min'));
+  var tMax = ee.Number(minMax.get('ST_B10_max'));
+  var tirsNorm = ee.Algorithms.If(tMin.neq(tMax), tirs.unitScale(tMin, tMax), tirs.multiply(0));
+  tirsNorm = ee.Image(tirsNorm);
+  
+  var ndbai = img.select('SR_B6').subtract(tirsNorm).divide(img.select('SR_B6').add(tirsNorm)).rename('NDBaI');
+  var nbli = img.select('SR_B4').subtract(tirsNorm).divide(img.select('SR_B4').add(tirsNorm)).rename('NBLI');
+  return img.addBands([mndwi, ndvi, ndbai, nbli]);
+}
+
+function getTargetCluster(img, indexName, numClusters, region) {
+  var training = img.select(indexName).sample({
+    region: region, scale: 30, numPixels: 5000, geometries: true
+  });
+  
+  var clusterer = ee.Clusterer.wekaKMeans(numClusters).train(training);
+  var result = img.select(indexName).cluster(clusterer).rename('cluster');
+  
+  var combined = img.select(indexName).addBands(result);
+  var means = combined.reduceRegion({
+    reducer: ee.Reducer.mean().group({groupField: 1, groupName: 'cluster'}),
+    geometry: region, scale: 100, bestEffort: true
+  });
+  
+  var groups = ee.List(ee.Dictionary(means).get('groups'));
+  var groupFeatures = ee.FeatureCollection(groups.map(function(dict) { return ee.Feature(null, dict); }));
+  var sortedFeatures = groupFeatures.sort('mean'); 
+  var sortedGroups = sortedFeatures.toList(numClusters).map(function(f) { return ee.Feature(f).toDictionary(); });
+  
+  return { classifiedImage: result, sortedGroups: sortedGroups };
+}
+
+function runALCC(roi, year) {
+  var rawImg = getLandsatImage(roi, year);
+  var bandCount = rawImg.bandNames().size();
+  var image = addIndices(rawImg, roi);
+  
+  // Step 1: Water
+  var step1 = getTargetCluster(image, 'MNDWI', 2, roi);
+  var waterId = ee.Dictionary(step1.sortedGroups.get(1)).get('cluster'); 
+  var waterMask = step1.classifiedImage.eq(ee.Number(waterId));
+  
+  // Step 2: Vegetation
+  var vegInput = image.updateMask(waterMask.not());
+  var step2 = getTargetCluster(vegInput, 'NDVI', 3, roi);
+  var highVegId = ee.Dictionary(step2.sortedGroups.get(2)).get('cluster');
+  var lowVegId = ee.Dictionary(step2.sortedGroups.get(1)).get('cluster');
+  var otherId = ee.Dictionary(step2.sortedGroups.get(0)).get('cluster');
+  var highVegMask = step2.classifiedImage.eq(ee.Number(highVegId)).and(waterMask.not());
+  var lowVegMask = step2.classifiedImage.eq(ee.Number(lowVegId)).and(waterMask.not());
+  var nonVegMask = step2.classifiedImage.eq(ee.Number(otherId)).and(waterMask.not());
+  
+  // Step 3: Bare
+  var bareInput = image.updateMask(nonVegMask);
+  var step3 = getTargetCluster(bareInput, 'NDBaI', 3, roi);
+  var bareId1 = ee.Dictionary(step3.sortedGroups.get(2)).get('cluster');
+  var mixedMask = step3.classifiedImage.neq(ee.Number(bareId1)).and(nonVegMask);
+  var bareMask1 = step3.classifiedImage.eq(ee.Number(bareId1)).and(nonVegMask);
+  
+  // Step 4: Built-up
+  var mixedInput = image.updateMask(mixedMask);
+  var step4 = getTargetCluster(mixedInput, 'NBLI', 2, roi);
+  var bareId2 = ee.Dictionary(step4.sortedGroups.get(1)).get('cluster');
+  var builtId = ee.Dictionary(step4.sortedGroups.get(0)).get('cluster');
+  var bareMask2 = step4.classifiedImage.eq(ee.Number(bareId2)).and(mixedMask);
+  var builtMask = step4.classifiedImage.eq(ee.Number(builtId)).and(mixedMask);
+  
+  var finalClass = ee.Image(0)
+    .where(waterMask, 1)
+    .where(highVegMask, 2)
+    .where(lowVegMask, 3)
+    .where(bareMask1, 4).where(bareMask2, 4)
+    .where(builtMask, 5)
+    .clip(roi)
+    .rename('ALCC_Class');
+    
+  return {classified: finalClass, raw: rawImg, bands: bandCount};
+}
+
+// 4. MAIN UI HANDLER
+function updateMap() {
+  // --- CLICK TRACKING ---
+  var thisClickId = Date.now();
+  lastClickId = thisClickId; // Update global ID
+  
+  // Reset UI
+  Map.clear();
+  resultsPanel.clear(); 
+  loadButton.setDisabled(true); 
+  loadButton.setLabel('Generating...');
+  
+  var statusLabel = ui.Label({
+    value: 'Please wait to load...',
+    style: {color: 'blue'}
+  });
+  resultsPanel.add(statusLabel);
+  
+  // --- Helper to re-enable button ---
+  function resetBtn() {
+    loadButton.setDisabled(false);
+    loadButton.setLabel('Generate Map');
+  }
+
+  // --- Validate Inputs ---
+  var yearStr = yearInput.getValue();
+  var year = parseInt(yearStr);
+  var currentYear = new Date().getFullYear();
+  var lastCompleteYear = currentYear - 1; 
+  
+  if (isNaN(year) || year < 2013 || year > (currentYear - 1)) {
+    statusLabel.setValue('Invalid Year. Please enter 2013-' + (currentYear-1));
+    statusLabel.style().set('color', 'red');
+    resetBtn();
+    return;
+  }
+  
+  var rawCityName = cityInput.getValue();
+  if (!rawCityName) {
+    statusLabel.setValue('Please enter a city name.');
+    statusLabel.style().set('color', 'red');
+    resetBtn();
+    return;
+  }
+  
+  // --- FORMAT CITY NAME ---
+  var cityName = formatCityName(rawCityName);
+  
+  var cityFeat = gaul.filter(ee.Filter.eq('ADM2_NAME', cityName));
+  
+  cityFeat.size().evaluate(function(size) {
+    // CHECK ID: If new click happened, abort this callback
+    if (thisClickId !== lastClickId) return;
+    
+    if (size === 0) {
+      statusLabel.setValue('Invalid geometry: City "' + cityName + '" not found in GAUL Level 2.');
+      statusLabel.style().set('color', 'red');
+      resetBtn();
+      return;
+    }
+    
+    var roi = cityFeat.geometry();
+    Map.centerObject(roi, 10);
+    
+    var result = runALCC(roi, year);
+    
+    result.bands.evaluate(function(bandCount) {
+      // CHECK ID: Abort if new click
+      if (thisClickId !== lastClickId) return;
+      
+      if (bandCount === 0) {
+        statusLabel.setValue('Data not available for ' + cityName + ' in ' + year + '. Try a different year.');
+        statusLabel.style().set('color', 'orange');
+        resetBtn();
+        return;
+      }
+      
+      var vizParams = {
+        min: 1, max: 5,
+        palette: ['blue', 'darkgreen', 'lightgreen', 'brown', 'red']
+      };
+      
+      Map.addLayer(result.raw, {bands:['SR_B4','SR_B3','SR_B2'], min:0, max:0.3}, 'True Color ' + year, false);
+      Map.addLayer(result.classified, vizParams, 'ALCC Classification ' + year);
+      
+      statusLabel.setValue('Map Created Successfully for ' + cityName + ', Please wait');
+      statusLabel.style().set('color', 'green');
+      
+      // Re-enable button
+      resetBtn();
+      
+      // --- ACCURACY ASSESSMENT (DYNAMIC WORLD 30M) ---
+      // Filter DW to match the user's selected year
+      var startDate = year + '-01-01';
+      var endDate = year + '-12-31';
+      
+      var dw = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1")
+        .filterDate(startDate, endDate)
+        .filterBounds(roi)
+        .select('label');
+        
+      // Force 30m reprojection to match ALCC grid
+      var dwMode = dw.reduce(ee.Reducer.mode())
+                     .reproject({crs: 'EPSG:4326', scale: 30})
+                     .clip(roi);
+      
+      // Remap DW classes to ALCC scheme:
+      var dwRemapped = dwMode.remap(
+        [0, 1, 2, 3, 4, 5, 6, 7], 
+        [1, 2, 3, 2, 3, 3, 5, 4]
+      ).rename('DW_Reference');
+      
+      // Sample using 30m scale
+      var sample = result.classified.addBands(dwRemapped).sample({
+        region: roi, scale: 30, numPixels: 2000, geometries: false
+      });
+      
+      var confusionMatrix = sample.errorMatrix('DW_Reference', 'ALCC_Class');
+      confusionMatrix.accuracy().evaluate(function(acc) {
+        // CHECK ID: Ensure result belongs to current click
+        if (thisClickId !== lastClickId) return;
+        
+        var accPercent = (acc * 100).toFixed(1);
+        resultsPanel.add(ui.Label({
+          value: 'Agreement with Dynamic World (30m, ' + year + '): ' + accPercent + '%',
+          style: {margin: '10px 0', fontSize: '12px', color: '#444'}
+        }));
+      });
+
+      // --- SAFE DOWNLOAD ---
+      result.classified.getDownloadURL({
+        name: 'ALCC_' + cityName + '_' + year + '_100m',
+        bands: ['ALCC_Class'],
+        region: roi, scale: 100, format: 'GEO_TIFF'
+      }, function(url) {
+        // CHECK ID: Ensure result belongs to current click
+        if (thisClickId !== lastClickId) return;
+        
+        if (url) {
+          resultsPanel.add(ui.Label({
+            value: 'Download Classification Tiff (100m Res)',
+            style: {color: 'blue', fontWeight: 'bold', margin: '5px 0', textDecoration: 'underline'},
+            targetUrl: url
+          }));
+          resultsPanel.add(ui.Label({value:'(Resolution reduced to 100m for download limit)', style:{fontSize:'10px', color:'gray'}}));
+        }
+      });
+
+      // --- LEGEND (Immediate add is safe) ---
+      var legendPanel = ui.Panel({style: {margin: '15px 0 0 0'}});
+      legendPanel.add(ui.Label({value: 'Legend', style: {fontWeight: 'bold'}}));
+      var addLegendRow = function(color, name) {
+        var box = ui.Label({style: {backgroundColor: color, padding: '8px', margin: '0 5px 5px 0'}});
+        var label = ui.Label({value: name, style: {margin: '0'}});
+        return ui.Panel({widgets: [box, label], layout: ui.Panel.Layout.Flow('horizontal')});
+      };
+      legendPanel.add(addLegendRow('blue', 'Water'));
+      legendPanel.add(addLegendRow('darkgreen', 'High Veg'));
+      legendPanel.add(addLegendRow('lightgreen', 'Low Veg'));
+      legendPanel.add(addLegendRow('brown', 'Bare Land'));
+      legendPanel.add(addLegendRow('red', 'Built-up'));
+      resultsPanel.add(legendPanel);
+    });
+  });
+}
+
+loadButton.onClick(updateMap);
